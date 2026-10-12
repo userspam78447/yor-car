@@ -49,3 +49,5 @@ npm run build
 Testes preservam os fluxos SQLite, executam migrations/SQL no PostgreSQL embarcado PGlite e verificam transações, RLS e Storage com doubles. Não substituem conexão TLS/pooler, URLs assinadas ou concorrência entre processos no Supabase real. A versão não foi publicada, enviada ao GitHub ou validada contra Supabase real nesta adaptação.
 
 .vercelignore e excludeFiles impedem incluir bancos, uploads e credenciais locais no pacote da função.
+
+Deploy atualizado
