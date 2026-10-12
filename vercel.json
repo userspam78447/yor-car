@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.mjs": {
+      "includeFiles": "public/**",
+      "excludeFiles": "{public/uploads/**,database/**,_admin/**,.env,.env.*,tests/**,supabase/**}",
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.mjs"
+    }
+  ],
+  "buildCommand": "npm run build"
+}

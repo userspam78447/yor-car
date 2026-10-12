@@ -1,0 +1,70 @@
+import {trackingSQL} from './order-tracking.mjs';
+import {DatabaseSync} from 'node:sqlite';
+import {mkdirSync} from 'node:fs';
+import {dirname} from 'node:path';
+export const schema={
+ vehicles:{brand:'text',model:'text',version:'text',year:'number',km:'number',condition:'condition',transmission:'text',fuel:'text',color:'text',body:'text',location:'text',price:'money',cost:'money',status:'vehicleStatus',image:'url',gallery:'text',description:'text',features:'text',offer:'boolean'},
+ customers:{name:'text',email:'email',phone:'text',notes:'text'},
+ leads:{name:'text',email:'email',phone:'text',vehicle_id:'vehicle',seller_id:'seller',source:'text',status:'leadStatus',message:'text'},
+ orders:{customer_id:'customer',vehicle_id:'vehicle',seller_id:'seller',status:'orderStatus',notes:'text'},
+ expenses:{description:'text',amount:'money',category:'text',date:'date',vehicle_id:'vehicle'},
+ appointments:{name:'text',phone:'text',email:'email',vehicle_id:'vehicle',seller_id:'seller',date:'date',time:'time',status:'appointmentStatus'},
+ users:{name:'text',email:'email',role:'role',password:'password',active:'boolean'},
+ settings:{name:'text',value:'text'},
+ notifications:{title:'text',message:'text',read:'boolean'}
+};
+const choices={condition:['Usado','Seminovo','Novo','0 km'],vehicleStatus:['DISPONIVEL','RESERVADO'],leadStatus:['NOVO','CONTATO','NEGOCIACAO','CONVERTIDO','PERDIDO'],orderStatus:['PENDENTE','RESERVADO','CANCELADO'],appointmentStatus:['PENDENTE','CONFIRMADO','CONCLUIDO','CANCELADO'],role:['ADMIN','VENDEDOR']};
+export const restricted=new Set(['users','settings','audit']);
+export function openDB(path){mkdirSync(dirname(path),{recursive:true});const db=new DatabaseSync(path);db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
+ for(const [table,fields] of Object.entries(schema)){const cols=Object.entries(fields).filter(([k])=>k!=='password').map(([k,t])=>`${k} ${['number','money','boolean','vehicle','customer','seller'].includes(t)?'INTEGER':'TEXT'}${['vehicle','customer','seller'].includes(t)?` REFERENCES ${t==='vehicle'?'vehicles':t==='customer'?'customers':'users'}(id)`:''}`);if(table==='users')cols.push('password_hash TEXT NOT NULL');db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id INTEGER PRIMARY KEY,${cols.join(',')},created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`)}
+ if(!db.prepare('PRAGMA table_info(vehicles)').all().some(c=>c.name==='condition'))db.exec('ALTER TABLE vehicles ADD COLUMN condition TEXT');
+ db.exec("UPDATE vehicles SET condition=CASE WHEN km=0 THEN 'Novo' ELSE 'Seminovo' END WHERE condition IS NULL");
+ db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email); CREATE UNIQUE INDEX IF NOT EXISTS settings_name ON settings(name); CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY,vehicle_id INTEGER NOT NULL UNIQUE REFERENCES vehicles(id),customer_id INTEGER NOT NULL REFERENCES customers(id),seller_id INTEGER NOT NULL REFERENCES users(id),lead_id INTEGER REFERENCES leads(id),order_id INTEGER REFERENCES orders(id),amount INTEGER NOT NULL CHECK(amount>0),cost INTEGER NOT NULL,profit INTEGER NOT NULL,margin REAL NOT NULL,date TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+ CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,sale_id INTEGER NOT NULL REFERENCES sales(id),amount INTEGER NOT NULL CHECK(amount>0),date TEXT NOT NULL,method TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),action TEXT NOT NULL,entity TEXT NOT NULL,record_id INTEGER,detail TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));`);db.exec(trackingSQL);return db;
+}
+
+// Async counterparts use the same SQL and validation rules for PostgreSQL while
+// native SQLite stays available for the local application and tests.
+export async function auditAsync(db,user,action,entity,id,detail=''){
+ await db.prepare('INSERT INTO audit(user_id,action,entity,record_id,detail) VALUES(?,?,?,?,?)').run(user?.id??null,action,entity,id,detail);
+}
+export async function transactionAsync(db,fn){return db.transaction(fn)}
+export async function saleAsync(db,user,input){
+ return transactionAsync(db,async()=>{
+ const v=await db.prepare('SELECT * FROM vehicles WHERE id=?').get(Number(input.vehicle_id));if(!v||v.status==='VENDIDO')fail('Veículo indisponível');
+ const c=await db.prepare('SELECT * FROM customers WHERE id=?').get(Number(input.customer_id)),s=await db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(Number(input.seller_id));if(!c||!s)fail('Cliente ou vendedor inválido');if(user.role==='VENDEDOR'&&s.id!==user.id)fail('Você só pode registrar suas próprias vendas',403);
+ const amount=Math.round(Number(input.amount)*100),received=Math.round(Number(input.received)*100);if(!Number.isSafeInteger(amount)||amount<=0||!Number.isSafeInteger(received)||received<0||received>amount)fail('Valores inválidos');const date=String(input.date||new Date().toISOString().slice(0,10));validate('expenses',{date},true);
+  const reservation=await db.prepare("SELECT customer_id FROM orders WHERE vehicle_id=? AND status='RESERVADO'").get(v.id);if(reservation&&reservation.customer_id!==c.id)fail('Veículo reservado para outro cliente. Cancele a reserva antes de vender.');let lead=null,order=null;
+  if(input.lead_id){lead=await db.prepare('SELECT * FROM leads WHERE id=?').get(Number(input.lead_id));if(!lead||lead.status==='CONVERTIDO'||(lead.vehicle_id&&lead.vehicle_id!==v.id))fail('Lead inválido para esta venda')}
+  if(input.order_id){order=await db.prepare('SELECT * FROM orders WHERE id=?').get(Number(input.order_id));if(!order||!['PENDENTE','RESERVADO'].includes(order.status)||order.customer_id!==c.id||order.vehicle_id!==v.id)fail('Pedido inválido para esta venda')}
+  const extra=(await db.prepare('SELECT COALESCE(SUM(amount),0) AS n FROM expenses WHERE vehicle_id=?').get(v.id)).n,cost=(v.cost||0)+extra,profit=amount-cost;
+  const result=await db.prepare('INSERT INTO sales(vehicle_id,customer_id,seller_id,lead_id,order_id,amount,cost,profit,margin,date) VALUES(?,?,?,?,?,?,?,?,?,?)').run(v.id,c.id,s.id,lead?.id??null,order?.id??null,amount,cost,profit,profit/amount*100,date),id=Number(result.lastInsertRowid);
+  await db.prepare("UPDATE vehicles SET status='VENDIDO' WHERE id=?").run(v.id);if(received)await db.prepare('INSERT INTO payments(sale_id,amount,date,method) VALUES(?,?,?,?)').run(id,received,date,String(input.method||'PIX').slice(0,60));
+  if(lead)await db.prepare("UPDATE leads SET status='CONVERTIDO',seller_id=? WHERE id=?").run(s.id,lead.id);
+  await db.prepare("UPDATE orders SET status=CASE WHEN customer_id=? THEN 'CONCLUIDO' ELSE 'CANCELADO' END WHERE vehicle_id=? AND status IN ('PENDENTE','RESERVADO')").run(c.id,v.id);
+  await db.prepare('INSERT INTO notifications(title,message,read) VALUES(?,?,0)').run('Venda registrada',`${v.brand} ${v.model} • ${c.name}`);
+  await auditAsync(db,user,'REGISTRAR_VENDA','sales',id,JSON.stringify({vehicle_id:v.id,customer_id:c.id,seller_id:s.id,amount,received,date}));return {id};
+ });
+}
+export async function paymentAsync(db,user,input){
+ const amount=Math.round(Number(input.amount)*100),id=Number(input.sale_id),date=String(input.date||new Date().toISOString().slice(0,10));validate('expenses',{date},true);
+ return transactionAsync(db,async()=>{const s=await db.prepare('SELECT * FROM sales WHERE id=?').get(id);if(!s)fail('Venda não encontrada');if(user.role==='VENDEDOR'&&s.seller_id!==user.id)fail('Acesso negado',403);const paid=(await db.prepare('SELECT COALESCE(SUM(amount),0) AS n FROM payments WHERE sale_id=?').get(id)).n;if(!Number.isSafeInteger(amount)||amount<=0||paid+amount>s.amount)fail('Recebimento excede o saldo ou valor inválido');const r=await db.prepare('INSERT INTO payments(sale_id,amount,date,method) VALUES(?,?,?,?)').run(id,amount,date,String(input.method||'PIX').slice(0,60));await auditAsync(db,user,'RECEBER','payments',Number(r.lastInsertRowid),JSON.stringify({sale_id:id,amount,date}));return {id:Number(r.lastInsertRowid)}});
+}
+export async function dashboardAsync(db,from,to){
+ const between='date BETWEEN ? AND ?',args=[from,to],one=(sql,params=args)=>db.prepare(sql).get(...params),all=(sql,params=args)=>db.prepare(sql).all(...params);
+ const total=await one(`SELECT COUNT(*) sales,COALESCE(SUM(amount),0) revenue,COALESCE(SUM(cost),0) costs,COALESCE(AVG(amount),0) ticket,COALESCE(AVG(margin),0) margin FROM sales WHERE ${between}`),cash=(await one(`SELECT COALESCE(SUM(amount),0) received FROM payments WHERE ${between}`)).received,expenses=(await one(`SELECT COALESCE(SUM(amount),0) expenses FROM expenses WHERE ${between}`)).expenses,overhead=(await one(`SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE vehicle_id IS NULL AND ${between}`)).n;
+ const stock=await one("SELECT SUM(status='DISPONIVEL') available,SUM(status='RESERVADO') reserved,SUM(status='VENDIDO') sold FROM vehicles",[]),leads=await one('SELECT COUNT(*) leads,SUM(status=\'CONVERTIDO\') converted FROM leads WHERE date(created_at,?) BETWEEN ? AND ?', ['-3 hours',...args]),orders=await one("SELECT COUNT(*) orders,SUM(status='PENDENTE') pending FROM orders WHERE date(created_at,?) BETWEEN ? AND ?", ['-3 hours',...args]);
+ const today=new Date().toLocaleDateString('sv-SE',{timeZone:'America/Bahia'}),month=today.slice(0,7),year=today.slice(0,4),monthly=(await one("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE substr(date,1,7)=?",[month])).n,yearly=(await one("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE substr(date,1,4)=?",[year])).n,totalReceived=(await one('SELECT COALESCE(SUM(amount),0) n FROM payments',[])).n;
+ const charts={sales:await all(`SELECT substr(date,1,7) label,COUNT(*) value FROM sales WHERE ${between} GROUP BY label ORDER BY label`),revenue:await all(`SELECT substr(date,1,7) label,SUM(amount) value FROM payments WHERE ${between} GROUP BY label ORDER BY label`),expenses:await all(`SELECT category label,SUM(amount) value FROM expenses WHERE ${between} GROUP BY label`),profit:await all(`SELECT label,SUM(value) value FROM (SELECT substr(date,1,7) label,profit value FROM sales WHERE ${between} UNION ALL SELECT substr(date,1,7) label,-amount value FROM expenses WHERE vehicle_id IS NULL AND ${between}) GROUP BY label ORDER BY label`,[...args,...args]),models:await all(`SELECT v.model label,COUNT(*) value FROM sales s JOIN vehicles v ON v.id=s.vehicle_id WHERE s.${between} GROUP BY label`),brands:await all(`SELECT v.brand label,COUNT(*) value FROM sales s JOIN vehicles v ON v.id=s.vehicle_id WHERE s.${between} GROUP BY label`),sellers:await all(`SELECT u.name label,SUM(s.amount) value FROM sales s JOIN users u ON u.id=s.seller_id WHERE s.${between} GROUP BY u.id`),sources:await all('SELECT source label,COUNT(*) value FROM leads WHERE date(created_at,?) BETWEEN ? AND ? GROUP BY source', ['-3 hours',...args]),funnel:await all('SELECT status label,COUNT(*) value FROM leads WHERE date(created_at,?) BETWEEN ? AND ? GROUP BY status', ['-3 hours',...args])};
+ return {...total,...stock,...leads,...orders,received:cash,expenses,profit:total.revenue-total.costs-overhead,conversion:leads.leads?(leads.converted||0)/leads.leads*100:0,month:monthly,year:yearly,totalReceived,charts};
+}
+export function fail(message,status=400){throw Object.assign(new Error(message),{status})}
+export function validate(entity,input,partial=false){const fields=schema[entity];if(!Object.hasOwn(schema,entity))fail('Seção inválida',404);const out={};for(const [key,value] of Object.entries(input)){if(!Object.hasOwn(fields,key))fail(`Campo inválido: ${key}`);const type=fields[key];if(value===''||value===null){out[key]=null;continue}if(['money','number','vehicle','customer','seller'].includes(type)){const n=Number(value);if(!Number.isFinite(n)||n<0||(type!=='money'&&!Number.isInteger(n))||n>1e10)fail(`Valor inválido: ${key}`);out[key]=type==='money'?Math.round(n*100):n;if(['vehicle','customer','seller'].includes(type)&&n===0)out[key]=null}else if(type==='boolean')out[key]=value===true||value===1||value==='1'?1:0;else {const s=type==='password'?String(value):String(value).trim();if(s.length>(entity==='vehicles'&&key==='gallery'?1000000:6000))fail('Texto muito longo');if(choices[type]&&!choices[type].includes(s))fail(`Opção inválida: ${key}`);if(type==='email'&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s))fail('E-mail inválido');if(type==='date'&&(!/^\d{4}-\d{2}-\d{2}$/.test(s)||Number.isNaN(Date.parse(s))||new Date(s).toISOString().slice(0,10)!==s))fail('Data inválida');if(type==='time'&&!/^([01]\d|2[0-3]):[0-5]\d$/.test(s))fail('Horário inválido');if(type==='url'&&!/^https?:\/\//.test(s)&&!/^\/(uploads|assets)\/[\w.-]+$/.test(s))fail('Use uma URL http ou https, ou envie uma foto.');if(type==='password'&&(s.length<10||Buffer.byteLength(s)>72))fail('Senha deve ter ao menos 10 caracteres e no máximo 72 bytes.');out[key]=s}}
+ if(!partial){const required={vehicles:['brand','model','price','cost','status'],customers:['name','phone'],leads:['name','phone','source','status'],orders:['customer_id','vehicle_id','status'],expenses:['description','amount','category','date'],appointments:['name','phone','date','time','status'],users:['name','email','password','role'],settings:['name'],notifications:['title']}[entity];for(const k of required??[])if(out[k]==null||out[k]==='')fail(`Preencha: ${k}`);if(entity==='vehicles'&&out.price<=0)fail('Preço deve ser positivo');if(entity==='expenses'&&out.amount<=0)fail('Despesa deve ser positiva')}
+ if(entity==='vehicles'&&out.gallery){const photos=[...new Set(out.gallery.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))];for(const url of photos)validate('vehicles',{image:url},true);out.gallery=photos.join('\n')}
+ if(entity==='vehicles'&&out.condition==='0 km'&&out.km>0)fail('Veículo 0 km deve ter quilometragem zero.');
+ return out;
+}
+
+export {saleAsync as sale,paymentAsync as payment,dashboardAsync as dashboard,auditAsync as audit,transactionAsync as transaction};
