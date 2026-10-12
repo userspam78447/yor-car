@@ -1,4 +1,6 @@
 import pg from 'pg';
+import {X509Certificate} from 'node:crypto';
+import {safeErrorDiagnostic} from './diagnostics.mjs';
 import {AsyncLocalStorage} from 'node:async_hooks';
 export const tables=['users','vehicles','customers','leads','orders','expenses','appointments','settings','notifications','sales','payments','audit','public_requests','media_uploads','order_tracking','rate_limits'];
 const identities=new Set(tables.filter(t=>!['public_requests','media_uploads','order_tracking','rate_limits'].includes(t)));
@@ -29,13 +31,27 @@ export function postgresAdapter(pool){
  },async resetSequences(){for(const table of identities)await query(`SELECT setval(pg_get_serial_sequence('your_car.${table}','id'), COALESCE((SELECT MAX(id) FROM your_car.${table}),1), EXISTS(SELECT 1 FROM your_car.${table}))`)},async close(){await pool.end()}};
  return db;
 }
+function configError(code,message,cause){return Object.assign(new Error(message,cause?{cause}:undefined),{code,stage:'postgres-config'})}
+export function postgresConfig(env=process.env){
+ if(!env.DATABASE_URL?.trim())throw configError('DATABASE_URL_MISSING','DATABASE_URL é obrigatória para Supabase.');
+ let url;try{url=new URL(env.DATABASE_URL.trim())}catch(cause){throw configError('DATABASE_URL_INVALID','DATABASE_URL inválida: confira a conexão PostgreSQL e a codificação da senha.',cause)}
+ if(!['postgres:','postgresql:'].includes(url.protocol))throw configError('DATABASE_URL_PROTOCOL','DATABASE_URL deve usar postgres:// ou postgresql://.');
+ if(!url.hostname||!url.username||!url.pathname.slice(1))throw configError('DATABASE_URL_INCOMPLETE','DATABASE_URL deve ter host, usuário e banco preenchidos, sem marcadores do painel.');
+ try{decodeURIComponent(url.href)}catch(cause){throw configError('DATABASE_URL_ENCODING','Codificação inválida na conexão PostgreSQL: caracteres especiais devem ser percent-encoded.',cause)}
+ if(/\[(?:YOUR[-_]|PROJECT[-_]|POOLER[-_])/i.test(decodeURIComponent(url.href)))throw configError('DATABASE_URL_PLACEHOLDER','Substitua os marcadores do painel na conexão PostgreSQL.');
+ if(!url.password&&!url.searchParams.get('password')&&!env.PGPASSWORD)throw configError('DATABASE_URL_PASSWORD','A senha PostgreSQL deve estar na conexão ou em PGPASSWORD.');
+ const ca=env.DATABASE_SSL_CA?.trim().replace(/\\r\\n/g,'\n').replace(/\\n/g,'\n');
+ if(!ca)throw configError('DATABASE_SSL_CA_MISSING','DATABASE_SSL_CA deve conter o certificado CA do Supabase (PEM).');
+ const certificates=ca.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+ if(!certificates?.length||ca.replace(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g,'').trim())throw configError('DATABASE_SSL_CA_FORMAT','DATABASE_SSL_CA deve conter o PEM completo, não um caminho de arquivo.');
+ try{for(const certificate of certificates)new X509Certificate(certificate)}catch(cause){throw configError('DATABASE_SSL_CA_INVALID','O certificado PEM em DATABASE_SSL_CA não é válido.',cause)}
+ // URL SSL options can overwrite pg's explicit ssl object. Keep verified TLS authoritative.
+ for(const key of ['ssl','sslmode','sslrootcert','sslcert','sslkey'])url.searchParams.delete(key);
+ return {connectionString:url.href,max:3,idleTimeoutMillis:10000,connectionTimeoutMillis:10000,ssl:{rejectUnauthorized:true,ca},statement_timeout:30000};
+}
 export async function createPostgresStorage(){
- if(!process.env.DATABASE_URL)throw Error('DATABASE_URL é obrigatória para Supabase.');
- const url=new URL(process.env.DATABASE_URL);if(!['postgres:','postgresql:'].includes(url.protocol))throw Error('DATABASE_URL deve ser PostgreSQL.');
- // Credentials never enter logs. Use the Supabase CA for certificate verification.
- if(!process.env.DATABASE_SSL_CA)throw Error('DATABASE_SSL_CA deve conter o certificado CA do Supabase (PEM).');
- url.searchParams.delete('sslmode');url.searchParams.delete('sslrootcert');
- const pool=new pg.Pool({connectionString:url.href,max:3,idleTimeoutMillis:10000,connectionTimeoutMillis:10000,ssl:{rejectUnauthorized:true,ca:process.env.DATABASE_SSL_CA},statement_timeout:30000});
- pool.on('error',error=>console.error('PostgreSQL pool error',{name:error.name}));
- try{await pool.query('SELECT id FROM your_car.users LIMIT 1');return {db:postgresAdapter(pool),raw:null,provider:'supabase'}}catch(error){await pool.end();throw error}
+ const config=postgresConfig();let pool;
+ try{pool=new pg.Pool(config)}catch(error){error.stage='postgres-pool';throw error}
+ pool.on('error',error=>console.error('PostgreSQL pool error',safeErrorDiagnostic(error,'postgres-pool')));
+ try{await pool.query('SELECT id FROM your_car.users LIMIT 1');return {db:postgresAdapter(pool),raw:null,provider:'supabase'}}catch(error){error.stage='postgres-connect';await pool.end().catch(()=>{});throw error}
 }

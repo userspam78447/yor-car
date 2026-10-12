@@ -10,7 +10,7 @@
     "migrate:photos": "node server/migrate-photos.mjs",
     "seed": "node server/seed.mjs",
     "test": "node --test --test-isolation=none tests/*.test.mjs",
-    "check": "node --check server/index.mjs && node --check server/domain.mjs && node --check server/storage.mjs && node --check server/middleware.mjs && node --check server/seed.mjs && node --check public/app.js && node --check public/ui.js && node --check public/public.js && node --check public/admin.js && node --check server/media.mjs && node --check server/migrate-sqlite.mjs && node --check server/migrate-photos.mjs && node --check server/vercel-handler.mjs && node --check api/index.mjs && node --check scripts/build.mjs && node --check client/storage-upload.js && node --check public/vehicle-photos.js && node --check server/order-tracking.mjs && node --check server/postgres.mjs"
+    "check": "node --check server/index.mjs && node --check server/domain.mjs && node --check server/storage.mjs && node --check server/middleware.mjs && node --check server/seed.mjs && node --check public/app.js && node --check public/ui.js && node --check public/public.js && node --check public/admin.js && node --check server/media.mjs && node --check server/migrate-sqlite.mjs && node --check server/migrate-photos.mjs && node --check server/vercel-handler.mjs && node --check api/index.mjs && node --check scripts/build.mjs && node --check client/storage-upload.js && node --check public/vehicle-photos.js && node --check server/order-tracking.mjs && node --check server/postgres.mjs && node --check server/diagnostics.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.117.3",
